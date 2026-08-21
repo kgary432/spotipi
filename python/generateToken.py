@@ -1,12 +1,17 @@
 import sys
-import spotipy
-import spotipy.util as util
 from spotipy.oauth2 import SpotifyOAuth
 
 if len(sys.argv) > 1:
     username = sys.argv[1]
     scope = 'user-read-currently-playing'
 
-    # This way removes the need for a browser, it will instead give the URL to visit in the terminal
-    auth = SpotifyOAuth(scope=scope, open_browser=False)
-    token = auth.get_access_token()
+    # Print a URL instead of opening a browser (use a normal browser on another device)
+    auth = SpotifyOAuth(
+        scope=scope,
+        cache_path='.cache',
+        open_browser=False,
+    )
+    auth.get_access_token(as_dict=True)
+else:
+    print("Usage: %s username" % (sys.argv[0],))
+    sys.exit(1)
