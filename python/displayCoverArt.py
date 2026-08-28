@@ -1,3 +1,4 @@
+import math
 import time
 import sys
 import logging
@@ -9,6 +10,98 @@ from PIL import Image
 from rgbmatrix import RGBMatrix, RGBMatrixOptions
 import os
 import configparser
+
+# Visual spin rate: slow enough to read the cover, fast enough to read as a CD.
+SPIN_RPM = 16
+SPIN_STEP_DEG = 8
+POLL_SECONDS = 1.0
+
+
+def _square_cover(src, size):
+    img = src.convert('RGB')
+    width, height = img.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    img = img.crop((left, top, left + side, top + side))
+    return img.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def make_cd_disc(src, size):
+    """Turn an album cover into a circular CD on a black background."""
+    disc = _square_cover(src, size)
+    pixels = disc.load()
+    cx = (size - 1) / 2.0
+    cy = (size - 1) / 2.0
+    outer_r = size / 2.0 - 0.35
+    hole_r = max(1.6, size * 0.07)
+    hub_r = max(hole_r + 1.5, size * 0.17)
+    rim_w = max(1.0, size * 0.035)
+
+    for y in range(size):
+        for x in range(size):
+            dx = x - cx
+            dy = y - cy
+            dist = math.hypot(dx, dy)
+            if dist > outer_r or dist < hole_r:
+                pixels[x, y] = (0, 0, 0)
+                continue
+
+            r, g, b = pixels[x, y]
+
+            if dist < hub_r:
+                t = (dist - hole_r) / (hub_r - hole_r)
+                if t < 0.55:
+                    metal = 170 + int(70 * t)
+                    r, g, b = metal, metal, min(255, metal + 12)
+                else:
+                    mix = 0.55
+                    metal = 210
+                    r = int(metal * mix + r * (1 - mix))
+                    g = int(metal * mix + g * (1 - mix))
+                    b = int((metal + 8) * mix + b * (1 - mix))
+
+            if dist > outer_r - 1.1:
+                # Metallic rim so the disc edge reads against the black matrix.
+                r = min(255, int(r * 0.25 + 110))
+                g = min(255, int(g * 0.25 + 110))
+                b = min(255, int(b * 0.25 + 120))
+            elif dist > outer_r - rim_w:
+                fade = (outer_r - dist) / rim_w
+                shade = 0.45 + 0.55 * fade
+                r = int(r * shade)
+                g = int(g * shade)
+                b = int(b * shade)
+
+            # Specular streak + faint grooves so rotation is visible.
+            ang = math.atan2(dy, dx)
+            shine = (math.cos(ang - 0.6) * 0.5 + 0.5) ** 4 * 36
+            groove = abs(math.sin(dist * 2.2)) * 8
+            r = min(255, max(0, int(r + shine - groove)))
+            g = min(255, max(0, int(g + shine - groove)))
+            b = min(255, max(0, int(b + shine - groove)))
+            pixels[x, y] = (r, g, b)
+
+    return disc
+
+
+def make_spin_frames(disc, matrix_w, matrix_h):
+    frames = []
+    for angle in range(0, 360, SPIN_STEP_DEG):
+        rotated = disc.rotate(
+            -angle,
+            resample=Image.Resampling.BILINEAR,
+            fillcolor=(0, 0, 0),
+        )
+        if rotated.size != (matrix_w, matrix_h):
+            canvas = Image.new('RGB', (matrix_w, matrix_h), (0, 0, 0))
+            ox = (matrix_w - rotated.size[0]) // 2
+            oy = (matrix_h - rotated.size[1]) // 2
+            canvas.paste(rotated, (ox, oy))
+            rotated = canvas
+        frames.append(rotated)
+    return frames
+
 
 if len(sys.argv) > 2:
     username = sys.argv[1]
@@ -47,33 +140,46 @@ if len(sys.argv) > 2:
     fallback = Image.open(default_image).convert('RGB')
 
     matrix = RGBMatrix(options=options)
-    fallback.thumbnail((matrix.width, matrix.height), Image.Resampling.LANCZOS)
-
+    disc_size = min(matrix.width, matrix.height)
+    fallback_frames = make_spin_frames(
+        make_cd_disc(fallback, disc_size),
+        matrix.width,
+        matrix.height,
+    )
+    frames = fallback_frames
     prevSong = ""
-    currentSong = ""
+    last_poll = 0.0
+    spin_t0 = time.time()
+    canvas = matrix.CreateFrameCanvas()
 
     try:
         while True:
-            try:
-                info = getSongInfo(username, token_path)
-                if not info:
-                    raise RuntimeError("No song playing or no Spotify token")
+            now = time.time()
+            if now - last_poll >= POLL_SECONDS:
+                last_poll = now
+                try:
+                    info = getSongInfo(username, token_path)
+                    if not info:
+                        raise RuntimeError("No song playing or no Spotify token")
 
-                imageURL = info[1]
-                currentSong = imageURL
+                    imageURL = info[1]
+                    if prevSong != imageURL:
+                        response = requests.get(imageURL, timeout=8)
+                        response.raise_for_status()
+                        image = Image.open(BytesIO(response.content))
+                        disc = make_cd_disc(image, disc_size)
+                        frames = make_spin_frames(disc, matrix.width, matrix.height)
+                        prevSong = imageURL
+                except Exception as e:
+                    frames = fallback_frames
+                    prevSong = ""
+                    print(e)
 
-                if prevSong != currentSong:
-                    response = requests.get(imageURL)
-                    image = Image.open(BytesIO(response.content))
-                    image.thumbnail((matrix.width, matrix.height), Image.Resampling.LANCZOS)
-                    matrix.SetImage(image.convert('RGB'))
-                    prevSong = currentSong
-
-                time.sleep(1)
-            except Exception as e:
-                matrix.SetImage(fallback)
-                print(e)
-                time.sleep(1)
+            elapsed = time.time() - spin_t0
+            angle = (elapsed * SPIN_RPM / 60.0) * 360.0
+            idx = int(angle / SPIN_STEP_DEG) % len(frames)
+            canvas.SetImage(frames[idx])
+            canvas = matrix.SwapOnVSync(canvas)
     except KeyboardInterrupt:
         sys.exit(0)
 
