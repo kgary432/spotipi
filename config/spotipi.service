@@ -1,14 +1,17 @@
 [Unit]
 Description=Spotipi led matrix service
+After=local-fs.target
 
 [Service]
-StandardOutput=syslog
-StandardError=syslog
+User=root
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=spotipi
 LimitRTPRIO=99
+LimitMEMLOCK=infinity
 Restart=always
 RestartSec=3
-EnvironmentFile=/etc/systemd/system/spotipi.service.d/spotipi_env.conf
+ExecStartPre=/bin/sleep 5
 
 [Install]
 WantedBy=multi-user.target

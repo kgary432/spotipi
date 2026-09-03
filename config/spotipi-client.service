@@ -1,9 +1,11 @@
 [Unit]
 Description=Spotipi web service
+After=local-fs.target
 
 [Service]
-StandardOutput=syslog
-StandardError=syslog
+User=root
+StandardOutput=journal
+StandardError=journal
 SyslogIdentifier=spotipi-client
 Restart=always
 RestartSec=3

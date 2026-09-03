@@ -1,9 +1,11 @@
 import math
 import time
 import sys
+import traceback
 import logging
+import threading
 from logging.handlers import RotatingFileHandler
-from getSongInfo import getSongInfo
+from getSongInfo import getSongInfo, NothingPlaying, SpotifyAuthError
 import requests
 from io import BytesIO
 from PIL import Image
@@ -103,7 +105,11 @@ def make_spin_frames(disc, matrix_w, matrix_h):
     return frames
 
 
-if len(sys.argv) > 2:
+if len(sys.argv) <= 2:
+    print("Usage: %s username token_path" % (sys.argv[0],))
+    sys.exit(1)
+
+try:
     username = sys.argv[1]
     token_path = sys.argv[2]
 
@@ -113,12 +119,15 @@ if len(sys.argv) > 2:
     logging.basicConfig(
         format='%(asctime)s %(message)s',
         datefmt='%m/%d/%Y %I:%M:%S %p',
-        filename='spotipy.log',
+        stream=sys.stderr,
         level=logging.INFO,
     )
     logger = logging.getLogger('spotipy_logger')
-    handler = RotatingFileHandler('spotipy.log', maxBytes=2000, backupCount=3)
-    logger.addHandler(handler)
+    try:
+        handler = RotatingFileHandler('spotipy.log', maxBytes=2000, backupCount=3)
+        logger.addHandler(handler)
+    except Exception as e:
+        print("log file unavailable:", e, flush=True)
 
     config = configparser.ConfigParser()
     config.read(filename)
@@ -136,9 +145,14 @@ if len(sys.argv) > 2:
     options.drop_privileges = False
 
     default_image = os.path.join(dir, config['DEFAULT']['default_image'])
-    print(default_image)
+    print("default image:", default_image, flush=True)
     fallback = Image.open(default_image).convert('RGB')
 
+    print(
+        "starting matrix %sx%s mapping=%s"
+        % (options.cols, options.rows, options.hardware_mapping),
+        flush=True,
+    )
     matrix = RGBMatrix(options=options)
     disc_size = min(matrix.width, matrix.height)
     fallback_frames = make_spin_frames(
@@ -146,43 +160,54 @@ if len(sys.argv) > 2:
         matrix.width,
         matrix.height,
     )
-    frames = fallback_frames
-    prevSong = ""
-    last_poll = 0.0
+    state = {
+        "frames": fallback_frames,
+        "prev_song": "",
+    }
     spin_t0 = time.time()
     canvas = matrix.CreateFrameCanvas()
+    # Paint before any Spotify/network call so a reboot is not a black panel.
+    canvas.SetImage(state["frames"][0])
+    canvas = matrix.SwapOnVSync(canvas)
+    print("matrix running", flush=True)
 
-    try:
+    def poll_spotify():
         while True:
-            now = time.time()
-            if now - last_poll >= POLL_SECONDS:
-                last_poll = now
-                try:
-                    info = getSongInfo(username, token_path)
-                    if not info:
-                        raise RuntimeError("No song playing or no Spotify token")
+            try:
+                info = getSongInfo(username, token_path)
+                imageURL = info[1]
+                if state["prev_song"] != imageURL:
+                    response = requests.get(imageURL, timeout=8)
+                    response.raise_for_status()
+                    image = Image.open(BytesIO(response.content))
+                    disc = make_cd_disc(image, disc_size)
+                    state["frames"] = make_spin_frames(
+                        disc, matrix.width, matrix.height
+                    )
+                    state["prev_song"] = imageURL
+                    print("cover updated", flush=True)
+            except NothingPlaying as e:
+                # Keep the last album art when Spotify is paused / idle.
+                print(e, flush=True)
+            except SpotifyAuthError as e:
+                state["frames"] = fallback_frames
+                state["prev_song"] = ""
+                print(e, flush=True)
+            except Exception as e:
+                print(e, flush=True)
+            time.sleep(POLL_SECONDS)
 
-                    imageURL = info[1]
-                    if prevSong != imageURL:
-                        response = requests.get(imageURL, timeout=8)
-                        response.raise_for_status()
-                        image = Image.open(BytesIO(response.content))
-                        disc = make_cd_disc(image, disc_size)
-                        frames = make_spin_frames(disc, matrix.width, matrix.height)
-                        prevSong = imageURL
-                except Exception as e:
-                    frames = fallback_frames
-                    prevSong = ""
-                    print(e)
+    threading.Thread(target=poll_spotify, name="spotify-poll", daemon=True).start()
 
-            elapsed = time.time() - spin_t0
-            angle = (elapsed * SPIN_RPM / 60.0) * 360.0
-            idx = int(angle / SPIN_STEP_DEG) % len(frames)
-            canvas.SetImage(frames[idx])
-            canvas = matrix.SwapOnVSync(canvas)
-    except KeyboardInterrupt:
-        sys.exit(0)
-
-else:
-    print("Usage: %s username token_path" % (sys.argv[0],))
+    while True:
+        frames = state["frames"]
+        elapsed = time.time() - spin_t0
+        angle = (elapsed * SPIN_RPM / 60.0) * 360.0
+        idx = int(angle / SPIN_STEP_DEG) % len(frames)
+        canvas.SetImage(frames[idx])
+        canvas = matrix.SwapOnVSync(canvas)
+except KeyboardInterrupt:
+    sys.exit(0)
+except Exception:
+    traceback.print_exc()
     sys.exit(1)
